@@ -10,15 +10,25 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 symbol = "XRPUSDT"
 HEADERS = ["timestamp", "datetime_utc", "open", "high", "low", "close", "volume", "quote_volume", "trade_count", "taker_buy_volume", "taker_buy_quote_volume"]
 
-print(f"Starting cloud download for {symbol}...")
+now = datetime.datetime.now(datetime.timezone.utc)
+current_year = now.year
+current_month = now.month
+current_day = now.day
 
-tasks = []
-for y in range(2017, 2027):
+print(f"=== Dynamic Ingestion Runner for {symbol} (UTC Now: {now.strftime('%Y-%m-%d %H:%M:%S')}) ===")
+
+# 1. Closed Past Months (from 2017 to last month)
+past_month_tasks = []
+for y in range(2017, current_year + 1):
     for m in range(1, 13):
-        if (y, m) <= (2026, 9):
-            tasks.append((y, m))
+        # Only months strictly before the current month
+        if (y < current_year) or (y == current_year and m < current_month):
+            target_path = os.path.join("1m", str(y), f"{m:02d}", f"{symbol}_1m_{y}-{m:02d}.csv")
+            # Only download if not already saved!
+            if not os.path.exists(target_path):
+                past_month_tasks.append((y, m))
 
-def fetch_month(y, m):
+def fetch_monthly_archive(y, m):
     url = f"https://data.binance.vision/data/spot/monthly/klines/{symbol}/1m/{symbol}-1m-{y}-{m:02d}.zip"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
@@ -51,20 +61,34 @@ def fetch_month(y, m):
         w.writerows(rows)
     return (y, m, len(rows))
 
-total_candles = 0
-saved_months = 0
-with ThreadPoolExecutor(max_workers=20) as executor:
-    futures = [executor.submit(fetch_month, y, m) for y, m in tasks]
-    for f in as_completed(futures):
-        res = f.result()
-        if res:
-            saved_months += 1
-            total_candles += res[2]
+if past_month_tasks:
+    print(f"Fetching {len(past_month_tasks)} missing past monthly archives with 10 parallel workers...")
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(fetch_monthly_archive, y, m) for y, m in past_month_tasks]
+        for f in as_completed(futures):
+            res = f.result()
+            if res:
+                print(f"Saved completed month: {res[0]}-{res[1]:02d} ({res[2]:,} candles)")
+else:
+    print("All past months up to last month are already archived on disk!")
 
-# October 2026 daily
-oct_rows = []
-for d in range(1, 10):
-    url = f"https://data.binance.vision/data/spot/daily/klines/{symbol}/1m/{symbol}-1m-2026-10-{d:02d}.zip"
+# 2. Current Month Daily Klines (Day 1 up to yesterday)
+print(f"Checking current active month daily archives ({current_year}-{current_month:02d}, days 1 to {current_day - 1})...")
+current_month_file = os.path.join("1m", str(current_year), f"{current_month:02d}", f"{symbol}_1m_{current_year}-{current_month:02d}.csv")
+existing_rows = {}
+
+# Load existing current month candles if file already exists
+if os.path.exists(current_month_file):
+    with open(current_month_file, "r") as f:
+        reader = csv.reader(f)
+        next(reader, None) # skip header
+        for r in reader:
+            if len(r) >= len(HEADERS):
+                existing_rows[int(r[0])] = r
+
+new_days_fetched = 0
+for d in range(1, current_day):
+    url = f"https://data.binance.vision/data/spot/daily/klines/{symbol}/1m/{symbol}-1m-{current_year}-{current_month:02d}-{d:02d}.zip"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -72,28 +96,41 @@ for d in range(1, 10):
         with zipfile.ZipFile(io.BytesIO(data)) as z:
             name = z.namelist()[0]
             content = z.read(name).decode("utf-8")
+        day_candle_count = 0
         for r in csv.reader(io.StringIO(content)):
             if not r: continue
             raw_ts = int(r[0])
             ts = raw_ts // 1000 if len(str(raw_ts)) > 13 else raw_ts
             dt_utc = datetime.datetime.fromtimestamp(ts / 1000, tz=datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-            oct_rows.append([ts, dt_utc, r[1], r[2], r[3], r[4], r[5], r[7], r[8], r[9], r[10]])
+            existing_rows[ts] = [ts, dt_utc, r[1], r[2], r[3], r[4], r[5], r[7], r[8], r[9], r[10]]
+            day_candle_count += 1
+        new_days_fetched += 1
     except Exception:
         pass
 
-if oct_rows:
-    oct_rows.sort(key=lambda x: x[0])
-    target_dir = os.path.join("1m", "2026", "10")
+if existing_rows:
+    target_dir = os.path.join("1m", str(current_year), f"{current_month:02d}")
     os.makedirs(target_dir, exist_ok=True)
-    csv_path = os.path.join(target_dir, f"{symbol}_1m_2026-10.csv")
-    with open(csv_path, "w", newline="") as f:
+    all_sorted = [existing_rows[ts] for ts in sorted(existing_rows.keys())]
+    with open(current_month_file, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(HEADERS)
-        w.writerows(oct_rows)
-    saved_months += 1
-    total_candles += len(oct_rows)
+        w.writerows(all_sorted)
+    print(f"Current month {current_year}-{current_month:02d} updated with {len(all_sorted):,} total candles.")
 
-print(f"Downloaded {saved_months} months, {total_candles:,} total candles.")
+# 3. Dynamic README Statistics Calculation
+all_csvs = []
+total_candle_count = 0
+for root, dirs, files in os.walk("1m"):
+    for f in files:
+        if f.endswith(".csv"):
+            all_csvs.append(os.path.join(root, f))
+            # Fast count lines without loading whole file
+            with open(os.path.join(root, f), "r") as fl:
+                total_candle_count += max(0, sum(1 for _ in fl) - 1)
+
+all_csvs.sort()
+print(f"Repository Summary: {len(all_csvs)} monthly/daily files, {total_candle_count:,} total candles.")
 
 readme = f"""# {symbol} 1-Minute Historical Kline Dataset
 
@@ -105,8 +142,9 @@ An institutional-grade, open-source archive of cleaned, standardized, and valida
 - **Symbol:** `{symbol}`
 - **Market:** Binance Spot
 - **Timeframe:** 1 Minute (`1m`)
-- **Total Months:** `{saved_months}` months
-- **Total Candles:** `{total_candles:,}` 1-minute candles
+- **Total Archived Files:** `{len(all_csvs)}` files
+- **Total Candles:** `{total_candle_count:,}` 1-minute candles
+- **Last Updated:** `{now.strftime('%Y-%m-%d %H:%M:%S')} UTC`
 - **Schema:** `timestamp, datetime_utc, open, high, low, close, volume, quote_volume, trade_count, taker_buy_volume, taker_buy_quote_volume`
 
 ---
@@ -133,6 +171,14 @@ url = "https://raw.githubusercontent.com/parshant231234-eng/{symbol}-Historical-
 df = pd.read_csv(url)
 print(df.head())
 ```
+
+---
+
+## 🔄 Automated Ingestion Pipeline
+This repository automatically runs a weekly GitHub Actions workflow every Sunday midnight (UTC) to append newly closed daily candles and archive completed months.
 """
+
 with open("README.md", "w") as f:
     f.write(readme)
+
+print("Dynamic sync complete!")
