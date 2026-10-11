@@ -9,7 +9,8 @@ An institutional-grade, open-source archive of cleaned, standardized, and valida
 - **Market:** Binance Spot
 - **Timeframe:** 1 Minute (`1m`)
 - **Total Months:** `102` months
-- **Total Candles:** `4,430,268` 1-minute candles
+- **Total Candles:** `4,431,708` 1-minute candles
+- **Historical Range:** `2018-05-04 08:11:00` to `2026-10-10 23:59:00` (UTC)
 - **Schema:** `timestamp, datetime_utc, open, high, low, close, volume, quote_volume, trade_count, taker_buy_volume, taker_buy_quote_volume`
 
 ---
@@ -32,7 +33,7 @@ Load any month directly from GitHub's raw CDN without cloning the repository:
 ```python
 import pandas as pd
 
-url = "https://raw.githubusercontent.com/parshant231234-eng/XRPUSDT-Historical-Data/main/1m/2026/09/XRPUSDT_1m_2026-09.csv"
+url = "https://raw.githubusercontent.com/parshant231234-eng/XRPUSDT-Historical-Data/main/1m/2026/10/XRPUSDT_1m_2026-10.csv"
 df = pd.read_csv(url)
 print(df.head())
 ```
